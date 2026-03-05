@@ -2,6 +2,8 @@
 
 A quantitative benchmark comparing how efficiently [Claude Code](https://docs.anthropic.com/en/docs/claude-code) generates code across 13 programming languages.
 
+For a detailed discussion, see the blog post: [Which Programming Language Is Best for Claude Code?](https://dev.to/mame/which-programming-language-is-best-for-claude-code-508a) / [日本語版](https://zenn.dev/mametter/articles/3e8580ec034201)
+
 ## TL;DR
 
 At least for prototyping-scale tasks, Ruby, Python, and JavaScript (not TypeScript) appear to be the best fit for Claude Code — fastest, cheapest, and most stable.
