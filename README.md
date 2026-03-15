@@ -149,9 +149,29 @@ For real projects, framework availability matters — and if runtime speed is es
 ruby benchmark.rb                                # Run all languages × 3 trials (default: Claude)
 ruby benchmark.rb --lang python --trials 1       # Single language quick test
 ruby benchmark.rb --codex gemini --trials 5      # Use Gemini instead of Claude
+ruby benchmark.rb --codex gemini --problem minigit   # Write to artifacts/gemini/minigit/
 ruby benchmark.rb --help                         # Show all options
 ruby report.rb                                   # Generate results/report.md
 python3 plot.py                                  # Generate figures/*.png
+```
+
+Structured outputs by codex + problem:
+
+```bash
+bash scripts/run-benchmark.sh gemini minigit --lang python --trials 1
+bash scripts/generate-report.sh gemini minigit
+bash scripts/generate-figures.sh gemini minigit
+bash scripts/run-all.sh gemini minigit --lang python --trials 1
+```
+
+These commands write under:
+
+```text
+artifacts/<codex>/<problem>/
+  generated/
+  logs/
+  results/
+  figures/
 ```
 
 Requirements: Ruby, and the target language toolchains.
@@ -206,6 +226,8 @@ See **[CODEX_COMPARISON.md](./CODEX_COMPARISON.md)** for detailed comparison of 
 │   └── codex_loader.rb      # Configuration loader
 ├── config/
 │   └── codexes.yml          # Codex configuration
+├── artifacts/               # Namespaced outputs: <codex>/<problem>/...
+├── scripts/                 # Helper scripts for namespaced benchmark/report/figures
 ├── results/
 │   ├── results.json         # Raw benchmark data
 │   ├── meta.json            # Metadata

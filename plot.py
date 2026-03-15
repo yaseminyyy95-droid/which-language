@@ -3,9 +3,9 @@
 Generate box-and-dot plots for the coding AI language benchmark.
 
 Usage:
-    python plot.py results/results.json
+    python plot.py results/results.json [--codex gemini]
 
-Generates figures/ directory with PNG files.
+Defaults to a sibling figures/ directory when given .../results/results.json.
 """
 
 import argparse
@@ -90,37 +90,82 @@ DEFAULT_COLOUR = "#999999"
 
 # ── Load data ─────────────────────────────────────────────────────────────
 
-def load_results(path):
+def record_codex(record):
+    """Return the codex name for a result record."""
+    codex = record.get("codex")
+    if codex:
+        return codex
+    if "v1_claude" in record or "v2_claude" in record:
+        return "claude"
+    return "unknown"
+
+
+def phase_metrics(record, phase):
+    """Return metrics for a phase, supporting new and legacy schemas."""
+    metrics = record.get(f"{phase}_metrics")
+    if isinstance(metrics, dict):
+        return metrics
+
+    codex = record_codex(record)
+    legacy = record.get(f"{phase}_{codex}")
+    if isinstance(legacy, dict):
+        return legacy
+
+    fallback = record.get(f"{phase}_claude")
+    if isinstance(fallback, dict):
+        return fallback
+
+    return {}
+
+
+def load_results(path, codex=None):
     """Load results.json and return a flat DataFrame."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         raw = json.load(f)
 
+    selected_codex = codex.lower() if codex else None
     rows = []
     for r in raw:
+        row_codex = record_codex(r)
+        if selected_codex and selected_codex != "all" and row_codex != selected_codex:
+            continue
+
         lang = r["language"]
         trial = r["trial"]
-        v1c = r.get("v1_claude", {})
-        v2c = r.get("v2_claude", {})
+        v1m = phase_metrics(r, "v1")
+        v2m = phase_metrics(r, "v2")
         rows.append({
+            "codex": row_codex,
             "language": lang,
             "trial": trial,
-            "v1_time": r["v1_time"],
-            "v2_time": r["v2_time"],
-            "total_time": r["v1_time"] + r["v2_time"],
-            "v1_loc": r["v1_loc"],
-            "v2_loc": r["v2_loc"],
-            "v1_cost": v1c.get("cost_usd", 0),
-            "v2_cost": v2c.get("cost_usd", 0),
-            "total_cost": v1c.get("cost_usd", 0) + v2c.get("cost_usd", 0),
-            "v1_turns": v1c.get("num_turns", 0),
-            "v2_turns": v2c.get("num_turns", 0),
-            "total_turns": v1c.get("num_turns", 0) + v2c.get("num_turns", 0),
-            "v1_output_tokens": v1c.get("output_tokens", 0),
-            "v2_output_tokens": v2c.get("output_tokens", 0),
-            "v1_cache_read": v1c.get("cache_read_tokens", 0),
-            "v2_cache_read": v2c.get("cache_read_tokens", 0),
+            "v1_time": r.get("v1_time", 0),
+            "v2_time": r.get("v2_time", 0),
+            "total_time": r.get("v1_time", 0) + r.get("v2_time", 0),
+            "v1_loc": r.get("v1_loc", 0),
+            "v2_loc": r.get("v2_loc", 0),
+            "v1_cost": v1m.get("cost_usd", 0),
+            "v2_cost": v2m.get("cost_usd", 0),
+            "total_cost": v1m.get("cost_usd", 0) + v2m.get("cost_usd", 0),
+            "v1_turns": v1m.get("num_turns", 0),
+            "v2_turns": v2m.get("num_turns", 0),
+            "total_turns": v1m.get("num_turns", 0) + v2m.get("num_turns", 0),
+            "v1_output_tokens": v1m.get("output_tokens", 0),
+            "v2_output_tokens": v2m.get("output_tokens", 0),
+            "v1_cache_read": v1m.get("cache_read_tokens", 0),
+            "v2_cache_read": v2m.get("cache_read_tokens", 0),
         })
+
     return pd.DataFrame(rows)
+
+
+def codex_label(codex):
+    if not codex or codex == "all":
+        return "All Codexes"
+    return codex.capitalize()
+
+
+def plot_title(codex, text):
+    return f"{text} — {codex_label(codex)}"
 
 
 # ── Plotting helper ───────────────────────────────────────────────────────
@@ -265,34 +310,47 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("json", type=Path, help="Path to results.json")
     parser.add_argument(
-        "-o", "--outdir", type=Path, default=Path("figures"),
-        help="Output directory (default: figures/)",
+        "-o", "--outdir", type=Path, default=None,
+        help="Output directory (default: sibling figures/ if input is under results/)",
+    )
+    parser.add_argument(
+        "--codex",
+        default=None,
+        help="Filter to a codex (e.g. claude, gemini, all)",
     )
     args = parser.parse_args()
 
     if not args.json.exists():
         sys.exit(f"Error: {args.json} not found")
 
+    if args.outdir is None:
+        if args.json.parent.name == "results":
+            args.outdir = args.json.parent.parent / "figures"
+        else:
+            args.outdir = Path("figures")
+
     args.outdir.mkdir(parents=True, exist_ok=True)
-    df = load_results(args.json)
+    df = load_results(args.json, codex=args.codex)
+    if df.empty:
+        sys.exit("Error: no matching results found")
 
     # ── Total ─────────────────────────────────────────────────────────────
     print("Generating total plots …")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "total_time", ylabel="Time (s)",
-           title="Time for Claude Code to Generate a Mini-Git (v1+v2, 20 trials)", clip=300)
+           title=plot_title(args.codex, "Time to Generate MiniGit (v1+v2)"), clip=300)
     save(fig, args.outdir, "total_time")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "total_cost", ylabel="Cost (USD)",
-           title="Cost for Claude Code to Generate a Mini-Git (v1+v2, 20 trials)", clip=False)
+           title=plot_title(args.codex, "Cost to Generate MiniGit (v1+v2)"), clip=False)
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("$%.2f"))
     save(fig, args.outdir, "total_cost")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v2_loc", ylabel="Lines of code",
-           title="Lines of Code Generated by Claude Code (v2)", clip=False)
+           title=plot_title(args.codex, "Lines of Code Generated (v2)"), clip=False)
     save(fig, args.outdir, "total_lines")
 
     # ── v1 ───────────────────────────────────────────────────────────
@@ -300,18 +358,18 @@ def main():
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v1_time", ylabel="Time (s)",
-           title="Time to Generate a Mini-Git v1 (New Project)", clip=200)
+           title=plot_title(args.codex, "Time to Generate MiniGit v1"), clip=200)
     save(fig, args.outdir, "v1_time")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v1_cost", ylabel="Cost (USD)",
-           title="Cost to Generate a Mini-Git v1 (New Project)", clip=False)
+           title=plot_title(args.codex, "Cost to Generate MiniGit v1"), clip=False)
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("$%.2f"))
     save(fig, args.outdir, "v1_cost")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v1_loc", ylabel="Lines of code",
-           title="Lines of Code Generated by Claude Code (v1)", clip=False)
+           title=plot_title(args.codex, "Lines of Code Generated (v1)"), clip=False)
     save(fig, args.outdir, "v1_lines")
 
     # ── v2 ───────────────────────────────────────────────────────────
@@ -319,18 +377,18 @@ def main():
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v2_time", ylabel="Time (s)",
-           title="Time to Generate a Mini-Git v2 (Feature Extension)", clip=150)
+           title=plot_title(args.codex, "Time to Generate MiniGit v2"), clip=150)
     save(fig, args.outdir, "v2_time")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v2_cost", ylabel="Cost (USD)",
-           title="Cost to Generate a Mini-Git v2 (Feature Extension)", clip=False)
+           title=plot_title(args.codex, "Cost to Generate MiniGit v2"), clip=False)
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("$%.2f"))
     save(fig, args.outdir, "v2_cost")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v2_loc", ylabel="Lines of code",
-           title="Lines of Code Generated by Claude Code (v2)", clip=False)
+           title=plot_title(args.codex, "Lines of Code Generated (v2)"), clip=False)
     save(fig, args.outdir, "v2_lines")
 
     # ── Turns ─────────────────────────────────────────────────────────────
@@ -338,26 +396,26 @@ def main():
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v1_turns", ylabel="Turns",
-           title="Agent Turns to Generate a Mini-Git v1", clip=25)
+           title=plot_title(args.codex, "Agent Turns for MiniGit v1"), clip=25)
     save(fig, args.outdir, "v1_turns")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "v2_turns", ylabel="Turns",
-           title="Agent Turns to Generate a Mini-Git v2", clip=25)
+           title=plot_title(args.codex, "Agent Turns for MiniGit v2"), clip=25)
     save(fig, args.outdir, "v2_turns")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     boxdot(ax, df, "total_turns", ylabel="Turns",
-           title="Agent Turns to Generate a Mini-Git (v1+v2)", clip=45)
+           title=plot_title(args.codex, "Agent Turns for MiniGit (v1+v2)"), clip=45)
     save(fig, args.outdir, "total_turns")
 
     # ── Scatter: Time vs Cost ─────────────────────────────────────────────
     print("Generating scatter plots …")
 
     for time_col, cost_col, suffix, title in [
-        ("total_time", "total_cost", "total", "Time vs Cost to Generate a Mini-Git (v1+v2)"),
-        ("v1_time", "v1_cost", "v1", "Time vs Cost to Generate a Mini-Git v1"),
-        ("v2_time", "v2_cost", "v2", "Time vs Cost to Generate a Mini-Git v2"),
+        ("total_time", "total_cost", "total", "Time vs Cost for MiniGit (v1+v2)"),
+        ("v1_time", "v1_cost", "v1", "Time vs Cost for MiniGit v1"),
+        ("v2_time", "v2_cost", "v2", "Time vs Cost for MiniGit v2"),
     ]:
         fig, ax = plt.subplots(figsize=(8, 6))
         for lang in LANG_ORDER:
@@ -379,7 +437,7 @@ def main():
         ax.set_xlim(left=0)
         ax.set_ylim(bottom=0)
         ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("$%.2f"))
-        ax.set_title(title)
+        ax.set_title(plot_title(args.codex, title))
         ax.legend(
             fontsize=8, ncol=3, loc="upper left",
             framealpha=0.8, borderpad=0.5,
@@ -390,9 +448,9 @@ def main():
     print("Generating time vs LOC scatter plots …")
 
     for time_col, loc_col, suffix, title in [
-        ("total_time", "v2_loc", "total", "Time vs LOC to Generate a Mini-Git (v1+v2)"),
-        ("v1_time", "v1_loc", "v1", "Time vs LOC to Generate a Mini-Git v1"),
-        ("v2_time", "v2_loc", "v2", "Time vs LOC to Generate a Mini-Git v2"),
+        ("total_time", "v2_loc", "total", "Time vs LOC for MiniGit (v1+v2)"),
+        ("v1_time", "v1_loc", "v1", "Time vs LOC for MiniGit v1"),
+        ("v2_time", "v2_loc", "v2", "Time vs LOC for MiniGit v2"),
     ]:
         fig, ax = plt.subplots(figsize=(8, 6))
         for lang in LANG_ORDER:
@@ -413,7 +471,7 @@ def main():
         ax.set_ylabel("Lines of code")
         ax.set_xlim(left=0)
         ax.set_ylim(bottom=0)
-        ax.set_title(title)
+        ax.set_title(plot_title(args.codex, title))
         ax.legend(
             fontsize=8, ncol=3, loc="upper left",
             framealpha=0.8, borderpad=0.5,

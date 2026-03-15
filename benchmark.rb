@@ -7,12 +7,13 @@ require 'time'
 require 'open3'
 require 'timeout'
 require 'shellwords'
+require 'set'
 require_relative 'lib/codex_loader'
 
 BASE_DIR = File.expand_path(__dir__)
-WORK_DIR = File.join(BASE_DIR, 'generated')
-RESULTS_DIR = File.join(BASE_DIR, 'results')
-LOGS_DIR    = File.join(BASE_DIR, 'logs')
+DEFAULT_WORK_DIR = File.join(BASE_DIR, 'generated')
+DEFAULT_RESULTS_DIR = File.join(BASE_DIR, 'results')
+DEFAULT_LOGS_DIR    = File.join(BASE_DIR, 'logs')
 
 GO_DIR = File.join(Dir.home, '.local', 'go')
 NPM_PREFIX = File.join(Dir.home, '.local', 'npm')
@@ -49,6 +50,8 @@ selected_languages = nil
 selected_trials = TRIALS
 selected_start = 1
 selected_codex = nil
+selected_problem = nil
+selected_output_root = nil
 dry_run = false
 
 i = 0
@@ -66,6 +69,12 @@ while i < ARGV.length
   when '--codex', '-c'
     selected_codex = ARGV[i + 1]
     i += 2
+  when '--problem', '-p'
+    selected_problem = ARGV[i + 1]
+    i += 2
+  when '--output-root'
+    selected_output_root = File.expand_path(ARGV[i + 1], BASE_DIR)
+    i += 2
   when '--dry-run'
     dry_run = true
     i += 1
@@ -78,12 +87,15 @@ while i < ARGV.length
         --trials, -t NUM       Number of trials per language (default: #{TRIALS})
         --start, -s NUM        Starting trial number (default: 1)
         --codex, -c NAME       AI codex to use: #{CodexLoader.available_codexes.join(', ')} (default: #{CodexLoader.default_codex})
+        --problem, -p NAME     Problem namespace label (default: minigit)
+        --output-root PATH     Write generated/, logs/, and results/ under PATH
         --dry-run              Dry run mode (don't actually run codex)
         --help, -h             Show this help message
 
       Examples:
         ruby benchmark.rb --lang python --trials 1
         ruby benchmark.rb --codex gemini --lang ruby,python
+        ruby benchmark.rb --codex gemini --problem minigit
         ruby benchmark.rb --trials 10 --start 11
     HELP
     exit 0
@@ -94,6 +106,12 @@ end
 
 languages_to_run = selected_languages || LANGUAGES.keys
 selected_codex ||= CodexLoader.default_codex
+problem = selected_problem || 'minigit'
+selected_output_root ||= File.join(BASE_DIR, 'artifacts', selected_codex, problem) if selected_problem
+
+work_dir = selected_output_root ? File.join(selected_output_root, 'generated') : DEFAULT_WORK_DIR
+results_dir = selected_output_root ? File.join(selected_output_root, 'results') : DEFAULT_RESULTS_DIR
+logs_dir = selected_output_root ? File.join(selected_output_root, 'logs') : DEFAULT_LOGS_DIR
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -170,8 +188,20 @@ def run_tests(test_script, dir:)
   result = run_cmd(cmd, dir: dir, timeout: 120)
 
   output = result[:stdout] + result[:stderr]
-  passed = output[/PASSED:\s*(\d+)/, 1]&.to_i || 0
-  failed = output[/FAILED:\s*(\d+)/, 1]&.to_i || 0
+  passed_summary = output[/PASSED:\s*(\d+)/, 1]
+  failed_summary = output[/FAILED:\s*(\d+)/, 1]
+
+  passed = if passed_summary
+             passed_summary.to_i
+           else
+             output.scan(/^PASS:/).size
+           end
+
+  failed = if failed_summary
+             failed_summary.to_i
+           else
+             output.scan(/^FAIL:/).size
+           end
 
   {
     success: result[:success],
@@ -192,13 +222,15 @@ puts '=' * 60
 puts
 
 # Initialize codex
-codex = CodexLoader.create_codex(selected_codex)
-codex_version = codex.version
+codex = dry_run ? nil : CodexLoader.create_codex(selected_codex)
+codex_version = dry_run ? 'dry-run' : codex.version
 
 puts "Codex: #{selected_codex}"
 puts "Codex Version: #{codex_version}"
+puts "Problem: #{problem}"
 puts "Languages: #{languages_to_run.join(', ')}"
 puts "Trials: #{selected_start}..#{selected_start + selected_trials - 1} (#{selected_trials} trials)"
+puts "Output Root: #{selected_output_root || BASE_DIR}"
 puts "Dry run: #{dry_run}"
 puts
 
@@ -212,13 +244,14 @@ end
 puts
 
 # Ensure directories exist
-FileUtils.mkdir_p(WORK_DIR)
-FileUtils.mkdir_p(RESULTS_DIR)
+FileUtils.mkdir_p(work_dir)
+FileUtils.mkdir_p(results_dir)
+FileUtils.mkdir_p(logs_dir)
 
 # Warmup: run a trivial prompt so codex's process/cache is hot
 unless dry_run
   puts '--- Warmup ---'
-  warmup_dir = File.join(WORK_DIR, '.warmup')
+  warmup_dir = File.join(work_dir, '.warmup')
   FileUtils.mkdir_p(warmup_dir)
   codex.warmup(warmup_dir)
   FileUtils.rm_rf(warmup_dir)
@@ -235,8 +268,8 @@ selected_trials.times do |trial_idx|
     puts '=' * 60
 
     dir_name = lang.tr('/', '-')
-    v1_dir = File.join(WORK_DIR, "minigit-#{dir_name}-#{trial}-v1")
-    v2_dir = File.join(WORK_DIR, "minigit-#{dir_name}-#{trial}-v2")
+    v1_dir = File.join(work_dir, "minigit-#{dir_name}-#{trial}-v1")
+    v2_dir = File.join(work_dir, "minigit-#{dir_name}-#{trial}-v2")
     FileUtils.rm_rf(v1_dir)
     FileUtils.rm_rf(v2_dir)
     FileUtils.mkdir_p(v1_dir)
@@ -264,7 +297,7 @@ selected_trials.times do |trial_idx|
       puts "  [DRY RUN] Would run #{selected_codex} with prompt for v1 #{lang}"
       record[:v1_time] = 0
     else
-      v1_log = File.join(LOGS_DIR, "minigit-#{dir_name}-#{trial}-v1-#{selected_codex}.json")
+      v1_log = File.join(logs_dir, "minigit-#{dir_name}-#{trial}-v1-#{selected_codex}.json")
       puts "  Running #{selected_codex}..."
       v1_result = codex.run_generation(v1_prompt, dir: v1_dir, log_path: v1_log)
       record[:v1_time] = v1_result[:elapsed_seconds]
@@ -278,6 +311,10 @@ selected_trials.times do |trial_idx|
       record[:v1_failed_count] = test_result[:failed]
       record[:v1_total_count] = test_result[:total]
       puts "  Tests: #{test_result[:passed]}/#{test_result[:total]} passed (#{test_result[:success] ? 'PASS' : 'FAIL'})"
+      if !test_result[:success] && !test_result[:output].strip.empty?
+        puts '  Test output excerpt:'
+        test_result[:output].lines.last(8).each { |line| puts "    #{line.rstrip}" }
+      end
 
       record[:v1_loc] = count_loc(v1_dir, lang)
       puts "  LOC: #{record[:v1_loc]}"
@@ -298,7 +335,7 @@ selected_trials.times do |trial_idx|
       puts "  [DRY RUN] Would run #{selected_codex} with prompt for v2 #{lang}"
       record[:v2_time] = 0
     else
-      v2_log = File.join(LOGS_DIR, "minigit-#{dir_name}-#{trial}-v2-#{selected_codex}.json")
+      v2_log = File.join(logs_dir, "minigit-#{dir_name}-#{trial}-v2-#{selected_codex}.json")
       puts "  Running #{selected_codex}..."
       v2_result = codex.run_generation(v2_prompt, dir: v2_dir, log_path: v2_log)
       record[:v2_time] = v2_result[:elapsed_seconds]
@@ -312,6 +349,10 @@ selected_trials.times do |trial_idx|
       record[:v2_failed_count] = test_result[:failed]
       record[:v2_total_count] = test_result[:total]
       puts "  Tests: #{test_result[:passed]}/#{test_result[:total]} passed (#{test_result[:success] ? 'PASS' : 'FAIL'})"
+      if !test_result[:success] && !test_result[:output].strip.empty?
+        puts '  Test output excerpt:'
+        test_result[:output].lines.last(8).each { |line| puts "    #{line.rstrip}" }
+      end
 
       record[:v2_loc] = count_loc(v2_dir, lang)
       puts "  LOC: #{record[:v2_loc]}"
@@ -334,22 +375,28 @@ puts '=' * 60
 meta = {
   date: Time.now.strftime('%Y-%m-%d %H:%M:%S'),
   codex: selected_codex,
+  problem: problem,
   codex_version: codex_version,
   trials: selected_trials,
   versions: versions,
 }
 
-File.write(File.join(RESULTS_DIR, 'meta.json'), JSON.pretty_generate(meta))
+File.write(File.join(results_dir, 'meta.json'), JSON.pretty_generate(meta))
 
 # Load existing results and append new ones
-results_path = File.join(RESULTS_DIR, 'results.json')
+results_path = File.join(results_dir, 'results.json')
 existing = if File.exist?(results_path)
              JSON.parse(File.read(results_path)) rescue []
            else
              []
            end
-all_results = existing + results.map { |r| r.transform_keys(&:to_s) }
+new_results = results.map { |r| r.transform_keys(&:to_s) }
+replacement_keys = new_results.map { |r| [r['codex'].to_s, r['language'].to_s, r['trial'].to_s] }.to_set
+existing.reject! do |r|
+  replacement_keys.include?([r['codex'].to_s, r['language'].to_s, r['trial'].to_s])
+end
+all_results = existing + new_results
 File.write(results_path, JSON.pretty_generate(all_results))
 
-puts "Results saved to #{RESULTS_DIR}/"
+puts "Results saved to #{results_dir}/"
 puts 'Run `ruby report.rb` to generate the report.'

@@ -7,6 +7,7 @@ require 'uri'
 require 'time'
 require 'fileutils'
 
+
 # Google Gemini API adapter
 class GeminiCodex < BaseCodex
   API_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models'
@@ -74,8 +75,12 @@ class GeminiCodex < BaseCodex
         metrics: {
           input_tokens: input_tokens,
           output_tokens: output_tokens,
+          cache_creation_tokens: 0,
+          cache_read_tokens: 0,
+          num_turns: 1,
           cost_usd: cost_usd,
-          model: @model_name
+          model: @model_name,
+          duration_ms: (elapsed * 1000).round
         },
         response_text: response_text
       }
@@ -135,26 +140,197 @@ class GeminiCodex < BaseCodex
   end
 
   def save_generated_code(response_text, dir)
-    # Extract code from markdown code blocks if present
-    code_blocks = response_text.scan(/```(?:\w+)?\n(.*?)```/m)
+    lang = infer_language_from_dir(dir)
+    blocks = extract_code_blocks(response_text)
+    written_files = []
 
-    if code_blocks.empty?
-      # No code blocks found, save entire response as code
-      code = response_text.strip
-    else
-      # Use the largest code block (likely the main implementation)
-      code = code_blocks.max_by { |block| block[0].length }[0]
+    named_blocks = blocks.select { |block| block[:filename] }
+    if named_blocks.any?
+      named_blocks.each do |block|
+        path = File.join(dir, block[:filename])
+        FileUtils.mkdir_p(File.dirname(path))
+        File.write(path, block[:code])
+        written_files << block[:filename]
+      end
     end
 
-    # Detect if this is a script (shebang) or needs to be saved with extension
-    if code.start_with?('#!')
-      # Save as executable script
-      File.write(File.join(dir, 'minigit'), code)
-      FileUtils.chmod(0755, File.join(dir, 'minigit'))
-    else
-      # For now, just write the code - the test script will handle compilation
-      # In a full implementation, we'd detect the language and save appropriately
-      File.write(File.join(dir, 'generated_code.txt'), code)
+    primary_block = choose_primary_block(blocks, lang)
+    if primary_block
+      target = primary_target_for(lang)
+      unless target.nil? || written_files.include?(target)
+        code = normalize_script_for_target(primary_block[:code], lang, target)
+        File.write(File.join(dir, target), code)
+        written_files << target
+      end
+    elsif written_files.empty?
+      File.write(File.join(dir, 'generated_code.txt'), response_text.strip)
+      written_files << 'generated_code.txt'
     end
+
+    ensure_runtime_files(lang, dir, written_files)
+    chmod_if_present(File.join(dir, 'minigit'))
+    chmod_if_present(File.join(dir, 'build.sh'))
+  end
+
+  def infer_language_from_dir(dir)
+    dir_name = File.basename(dir).sub(/^minigit-/, '').sub(/-\d+-v[12]$/, '')
+    {
+      'python-mypy' => 'python/mypy',
+      'ruby-steep' => 'ruby/steep'
+    }.fetch(dir_name, dir_name)
+  end
+
+  def extract_code_blocks(response_text)
+    blocks = []
+    response_text.to_enum(:scan, /```(?<lang>[A-Za-z0-9_+-]*)\n(?<code>.*?)```/m).each do
+      match = Regexp.last_match
+      context = response_text[[match.begin(0) - 300, 0].max...match.begin(0)]
+      blocks << {
+        fence_lang: match[:lang].to_s.downcase,
+        filename: infer_filename_from_context(context),
+        code: match[:code].strip
+      }
+    end
+    blocks
+  end
+
+  def infer_filename_from_context(context)
+    backticked = context.scan(/`([^`\n]+)`/).flatten.reverse.find do |token|
+      token.match?(/\A(?:minigit|Makefile|makefile|build\.sh|[\w.\/-]+\.(?:rb|rbs|py|go|rs|c|h|ts|js|java|pl|pm|lua|scm|ml|mli|hs))\z/)
+    end
+    return backticked if backticked
+
+    file_named = context[/file named\s+[`"]?([A-Za-z0-9._\/-]+)[`"]?/i, 1]
+    return file_named if file_named
+
+    recent_context = context.lines.last(4).join
+    return 'Makefile' if recent_context.match?(/\bThe Makefile\b|\bMakefile\b/i)
+    return 'build.sh' if recent_context.match?(/\bbuild\.sh\b/i)
+
+    nil
+  end
+
+  def choose_primary_block(blocks, lang)
+    return nil if blocks.empty?
+
+    expected_fences = expected_fence_langs(lang)
+    blocks.find { |block| expected_fences.include?(block[:fence_lang]) } ||
+      blocks.max_by { |block| block[:code].length }
+  end
+
+  def expected_fence_langs(lang)
+    {
+      'python' => %w[python py],
+      'python/mypy' => %w[python py],
+      'ruby' => %w[ruby rb],
+      'ruby/steep' => %w[ruby rb rbs],
+      'javascript' => %w[javascript js node],
+      'typescript' => %w[typescript ts],
+      'perl' => %w[perl pl],
+      'lua' => %w[lua],
+      'scheme' => %w[scheme scm guile],
+      'rust' => %w[rust rs],
+      'go' => %w[go],
+      'c' => %w[c],
+      'java' => %w[java],
+      'ocaml' => %w[ocaml ml],
+      'haskell' => %w[haskell hs]
+    }.fetch(lang, [])
+  end
+
+  def primary_target_for(lang)
+    {
+      'python' => 'minigit',
+      'python/mypy' => 'minigit',
+      'ruby' => 'minigit',
+      'ruby/steep' => 'minigit',
+      'javascript' => 'minigit',
+      'perl' => 'minigit',
+      'lua' => 'minigit',
+      'go' => 'main.go',
+      'rust' => 'main.rs',
+      'c' => 'main.c',
+      'java' => 'MiniGit.java',
+      'typescript' => 'main.ts',
+      'scheme' => 'main.scm',
+      'ocaml' => 'main.ml',
+      'haskell' => 'Main.hs'
+    }[lang]
+  end
+
+  def normalize_script_for_target(code, lang, target)
+    return code if target != 'minigit' || code.start_with?('#!')
+
+    shebang = {
+      'python' => '#!/usr/bin/env python3',
+      'python/mypy' => '#!/usr/bin/env python3',
+      'ruby' => '#!/usr/bin/env ruby',
+      'ruby/steep' => '#!/usr/bin/env ruby',
+      'javascript' => '#!/usr/bin/env node',
+      'perl' => '#!/usr/bin/env perl',
+      'lua' => '#!/usr/bin/env lua'
+    }[lang]
+
+    shebang ? "#{shebang}\n#{code}\n" : code
+  end
+
+  def ensure_runtime_files(lang, dir, written_files)
+    case lang
+    when 'go'
+      write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nset -e\ngo build -o minigit main.go\n", written_files)
+    when 'rust'
+      write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nset -e\nrustc -O main.rs -o minigit\n", written_files)
+    when 'c'
+      write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nset -e\ngcc -O2 -o minigit main.c\n", written_files)
+    when 'java'
+      write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nset -e\njavac MiniGit.java\n", written_files)
+      write_if_missing(dir, 'minigit', launcher_script('java'), written_files)
+    when 'typescript'
+      write_if_missing(dir, 'minigit', launcher_script('typescript'), written_files)
+    when 'scheme'
+      write_if_missing(dir, 'minigit', launcher_script('scheme'), written_files)
+    when 'ocaml'
+      write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nset -e\nocamlc -o minigit main.ml\n", written_files)
+    when 'haskell'
+      write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nset -e\nghc -O2 -o minigit Main.hs\n", written_files)
+    end
+  end
+
+  def launcher_script(kind)
+    case kind
+    when 'java'
+      <<~BASH
+        #!/usr/bin/env bash
+        set -e
+        DIR="$(cd "$(dirname "$0")" && pwd)"
+        exec java -cp "$DIR" MiniGit "$@"
+      BASH
+    when 'typescript'
+      <<~BASH
+        #!/usr/bin/env bash
+        set -e
+        DIR="$(cd "$(dirname "$0")" && pwd)"
+        exec tsx "$DIR/main.ts" "$@"
+      BASH
+    when 'scheme'
+      <<~BASH
+        #!/usr/bin/env bash
+        set -e
+        DIR="$(cd "$(dirname "$0")" && pwd)"
+        exec guile -s "$DIR/main.scm" "$@"
+      BASH
+    end
+  end
+
+  def write_if_missing(dir, relative_path, content, written_files)
+    return if written_files.include?(relative_path)
+
+    path = File.join(dir, relative_path)
+    File.write(path, content)
+    written_files << relative_path
+  end
+
+  def chmod_if_present(path)
+    FileUtils.chmod(0755, path) if File.exist?(path)
   end
 end

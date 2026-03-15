@@ -2,19 +2,34 @@
 # frozen_string_literal: true
 # encoding: utf-8
 #
-# Generates results/report.md from results/results.json + results/meta.json
+# Generates a markdown report from results/results.json + results/meta.json
 #
 
 require 'json'
+require 'optparse'
+require 'fileutils'
 
 BASE_DIR    = File.expand_path(__dir__)
 RESULTS_DIR = File.join(BASE_DIR, 'results')
 
-results = JSON.parse(File.read(File.join(RESULTS_DIR, 'results.json')))
-meta    = JSON.parse(File.read(File.join(RESULTS_DIR, 'meta.json')))
+options = {
+  results_path: File.join(RESULTS_DIR, 'results.json'),
+  meta_path: nil,
+  output_path: nil,
+  codex: nil,
+}
 
-languages = results.map { |r| r['language'] }.uniq
-versions  = meta['versions'] || {}
+OptionParser.new do |opts|
+  opts.banner = 'Usage: ruby report.rb [options]'
+  opts.on('--codex NAME', 'Filter to a codex (e.g. claude, gemini, all)') { |v| options[:codex] = v }
+  opts.on('--results PATH', 'Path to results.json') { |v| options[:results_path] = v }
+  opts.on('--meta PATH', 'Path to meta.json') { |v| options[:meta_path] = v }
+  opts.on('--output PATH', 'Where to write the markdown report') { |v| options[:output_path] = v }
+end.parse!(ARGV)
+
+results_dir = File.dirname(options[:results_path])
+options[:meta_path] ||= File.join(results_dir, 'meta.json')
+options[:output_path] ||= File.join(results_dir, 'report.md')
 
 def fmt(n)
   n.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\1,').reverse
@@ -22,30 +37,73 @@ end
 
 def stddev(values)
   return 0.0 if values.size <= 1
+
   mean = values.sum / values.size.to_f
   Math.sqrt(values.sum { |v| (v - mean)**2 } / (values.size - 1).to_f)
 end
 
-def claude_field(record, phase, field)
-  cd = record["#{phase}_claude"]
-  cd ? (cd[field] || 0) : 0
+def record_codex(record)
+  return record['codex'] if record['codex']
+  return 'claude' if record.key?('v1_claude') || record.key?('v2_claude')
+
+  'unknown'
 end
 
-def total_tokens(cd)
-  return 0 unless cd
-  (cd['input_tokens'] || 0) + (cd['output_tokens'] || 0) +
-    (cd['cache_creation_tokens'] || 0) + (cd['cache_read_tokens'] || 0)
+def phase_metrics(record, phase)
+  metrics = record["#{phase}_metrics"]
+  return metrics if metrics.is_a?(Hash)
+
+  codex = record_codex(record)
+  legacy = record["#{phase}_#{codex}"]
+  return legacy if legacy.is_a?(Hash)
+
+  fallback = record["#{phase}_claude"]
+  fallback.is_a?(Hash) ? fallback : nil
 end
+
+def metric_field(record, phase, field)
+  metrics = phase_metrics(record, phase)
+  metrics ? (metrics[field] || 0) : 0
+end
+
+def total_tokens(metrics)
+  return 0 unless metrics
+
+  (metrics['input_tokens'] || 0) + (metrics['output_tokens'] || 0) +
+    (metrics['cache_creation_tokens'] || 0) + (metrics['cache_read_tokens'] || 0)
+end
+
+results = JSON.parse(File.read(options[:results_path]))
+meta = File.exist?(options[:meta_path]) ? JSON.parse(File.read(options[:meta_path])) : {}
+
+selected_codex = options[:codex] || meta['codex']
+if selected_codex && selected_codex != 'all'
+  results = results.select { |r| record_codex(r) == selected_codex }
+end
+
+abort 'No matching results found.' if results.empty?
+
+languages = results.map { |r| r['language'] }.uniq
+versions  = meta['versions'] || {}
 
 # ---------------------------------------------------------------------------
 report = []
 
-report << '# Claude Code Language Benchmark Report'
+report_codex = if selected_codex && selected_codex != 'all'
+                 selected_codex
+               else
+                 'all codexes'
+               end
+
+report << '# AI Coding Language Benchmark Report'
 report << ''
 report << '## Environment'
-report << "- Date: #{meta['date']}"
-report << "- Claude Version: #{meta['claude_version']}"
-report << "- Trials per language: #{meta['trials']}"
+report << "- Date: #{meta['date']}" if meta['date']
+report << "- Codex filter: #{report_codex}"
+report << "- Problem: #{meta['problem']}" if meta['problem']
+report << "- Codex version: #{meta['codex_version']}" if meta['codex_version'] && meta['codex'] == selected_codex
+report << "- Trials per language: #{meta['trials']}" if meta['trials']
+report << "- Records in report: #{results.size}"
 report << ''
 
 report << '## Language Versions'
@@ -66,38 +124,31 @@ languages.each do |lang|
   n  = lr.size.to_f
   next if n.zero?
 
-  # v1 time
   v1_times = lr.map { |r| r['v1_time'] || 0 }
   v1_avg = (v1_times.sum / n).round(1)
   v1_sd  = stddev(v1_times).round(1)
 
-  # v2 time
   v2_times = lr.map { |r| r['v2_time'] || 0 }
   v2_avg = (v2_times.sum / n).round(1)
   v2_sd  = stddev(v2_times).round(1)
 
-  # total time
   total_times = lr.map { |r| (r['v1_time'] || 0) + (r['v2_time'] || 0) }
   total_avg = (total_times.sum / n).round(1)
   total_sd  = stddev(total_times).round(1)
 
-  # turns
-  v1_turns = (lr.sum { |r| claude_field(r, 'v1', 'num_turns') } / n).round(1)
-  v2_turns = (lr.sum { |r| claude_field(r, 'v2', 'num_turns') } / n).round(1)
+  v1_turns = (lr.sum { |r| metric_field(r, 'v1', 'num_turns') } / n).round(1)
+  v2_turns = (lr.sum { |r| metric_field(r, 'v2', 'num_turns') } / n).round(1)
 
-  # LOC
   v1_loc = (lr.sum { |r| r['v1_loc'] } / n).round(0)
   v2_loc = (lr.sum { |r| r['v2_loc'] } / n).round(0)
 
-  # test results
   v1_pass = lr.count { |r| r['v1_pass'] }
   v2_pass = lr.count { |r| r['v2_pass'] }
   v1_tests = "#{v1_pass}/#{lr.size}"
   v2_tests = "#{v2_pass}/#{lr.size}"
 
-  # cost
   total_cost = lr.sum do |r|
-    %w[v1 v2].sum { |ph| claude_field(r, ph, 'cost_usd') }
+    %w[v1 v2].sum { |ph| metric_field(r, ph, 'cost_usd') }
   end
   avg_cost = total_cost / n
 
@@ -132,11 +183,11 @@ languages.each do |lang|
 
   lr.each do |r|
     %w[v1 v2].each do |ph|
-      sum_input        += claude_field(r, ph, 'input_tokens')
-      sum_output       += claude_field(r, ph, 'output_tokens')
-      sum_cache_create += claude_field(r, ph, 'cache_creation_tokens')
-      sum_cache_read   += claude_field(r, ph, 'cache_read_tokens')
-      sum_cost         += claude_field(r, ph, 'cost_usd')
+      sum_input        += metric_field(r, ph, 'input_tokens')
+      sum_output       += metric_field(r, ph, 'output_tokens')
+      sum_cache_create += metric_field(r, ph, 'cache_creation_tokens')
+      sum_cache_read   += metric_field(r, ph, 'cache_read_tokens')
+      sum_cost         += metric_field(r, ph, 'cost_usd')
     end
   end
 
@@ -156,8 +207,8 @@ report << ''
 # Full Results (all trials)
 # ---------------------------------------------------------------------------
 report << '## Full Results'
-report << '| Language | Trial | v1 Time | v1 Turns | v1 LOC | v1 Tests | v2 Time | v2 Turns | v2 LOC | v2 Tests | Total Time | Cost |'
-report << '|----------|-------|---------|----------|--------|----------|---------|----------|--------|----------|------------|------|'
+report << '| Codex | Language | Trial | v1 Time | v1 Turns | v1 LOC | v1 Tests | v2 Time | v2 Turns | v2 LOC | v2 Tests | Total Time | Cost |'
+report << '|-------|----------|-------|---------|----------|--------|----------|---------|----------|--------|----------|------------|------|'
 
 results.each do |r|
   v1t = r['v1_pass'] ? 'PASS' : 'FAIL'
@@ -165,13 +216,13 @@ results.each do |r|
   v1_tests = "#{r['v1_passed_count']}/#{r['v1_total_count']} #{v1t}"
   v2_tests = "#{r['v2_passed_count']}/#{r['v2_total_count']} #{v2t}"
 
-  v1_turns = claude_field(r, 'v1', 'num_turns')
-  v2_turns = claude_field(r, 'v2', 'num_turns')
+  v1_turns = metric_field(r, 'v1', 'num_turns')
+  v2_turns = metric_field(r, 'v2', 'num_turns')
 
   total_time = ((r['v1_time'] || 0) + (r['v2_time'] || 0)).round(1)
-  cost = %w[v1 v2].sum { |ph| claude_field(r, ph, 'cost_usd') }
+  cost = %w[v1 v2].sum { |ph| metric_field(r, ph, 'cost_usd') }
 
-  report << "| #{r['language'].capitalize} | #{r['trial']} " \
+  report << "| #{record_codex(r)} | #{r['language'].capitalize} | #{r['trial']} " \
             "| #{r['v1_time']}s | #{v1_turns} | #{r['v1_loc']} | #{v1_tests} " \
             "| #{r['v2_time']}s | #{v2_turns} | #{r['v2_loc']} | #{v2_tests} " \
             "| #{total_time}s | $#{'%.2f' % cost} |"
@@ -182,20 +233,20 @@ report << ''
 # Full Tokens (all trials)
 # ---------------------------------------------------------------------------
 report << '## Full Tokens'
-report << '| Language | Trial | Phase | Input | Output | Cache Create | Cache Read | Total | Cost USD |'
-report << '|----------|-------|-------|-------|--------|--------------|------------|-------|----------|'
+report << '| Codex | Language | Trial | Phase | Input | Output | Cache Create | Cache Read | Total | Cost USD |'
+report << '|-------|----------|-------|-------|-------|--------|--------------|------------|-------|----------|'
 
 results.each do |r|
   %w[v1 v2].each do |phase|
-    cd = r["#{phase}_claude"]
-    if cd
-      tot = total_tokens(cd)
-      report << "| #{r['language'].capitalize} | #{r['trial']} | #{phase} " \
-                "| #{fmt(cd['input_tokens'] || 0)} | #{fmt(cd['output_tokens'] || 0)} " \
-                "| #{fmt(cd['cache_creation_tokens'] || 0)} | #{fmt(cd['cache_read_tokens'] || 0)} " \
-                "| #{fmt(tot)} | $#{'%.4f' % (cd['cost_usd'] || 0)} |"
+    metrics = phase_metrics(r, phase)
+    if metrics
+      tot = total_tokens(metrics)
+      report << "| #{record_codex(r)} | #{r['language'].capitalize} | #{r['trial']} | #{phase} " \
+                "| #{fmt(metrics['input_tokens'] || 0)} | #{fmt(metrics['output_tokens'] || 0)} " \
+                "| #{fmt(metrics['cache_creation_tokens'] || 0)} | #{fmt(metrics['cache_read_tokens'] || 0)} " \
+                "| #{fmt(tot)} | $#{'%.4f' % (metrics['cost_usd'] || 0)} |"
     else
-      report << "| #{r['language'].capitalize} | #{r['trial']} | #{phase} | - | - | - | - | - | - |"
+      report << "| #{record_codex(r)} | #{r['language'].capitalize} | #{r['trial']} | #{phase} | - | - | - | - | - | - |"
     end
   end
 end
@@ -205,7 +256,8 @@ report << ''
 # Write
 # ---------------------------------------------------------------------------
 
-report_path = File.join(RESULTS_DIR, 'report.md')
+report_path = options[:output_path]
+FileUtils.mkdir_p(File.dirname(report_path))
 File.write(report_path, report.join("\n") + "\n")
 puts "Report written to: #{report_path}"
 puts
