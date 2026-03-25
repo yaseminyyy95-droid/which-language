@@ -6,93 +6,53 @@ require 'json'
 require 'uri'
 require 'time'
 require 'fileutils'
-require 'openssl'
 
 # GroqCodex: Adapter for high-performance inference via Groq API.
-# Metadata and detailed descriptions are handled via config/codexes.yml.
+# Utilizes OpenAI-compatible chat completion endpoints.
 class GroqCodex < BaseCodex
-  # Groq API endpoint for chat completions
+  MILLION = 1_000_000.0
+
   def initialize(config = {})
-    super('groq', config) # Shared configs are handled by BaseCodex
-    @api_key = config[:api_key] || ENV['GROQ_API_KEY']
-    @api_url = config[:api_url]
+    super('groq', config)
+    
+    # API Credentials & Config
+    @api_key      = presence(config[:api_key]) || ENV['GROQ_API_KEY']
+    @api_url      = presence(config[:api_url]) || presence(config[:api_endpoint])
+    @model_name   = presence(config[:model]) || presence(config[:model_name])
+    
+    # Runtime Settings
+    @cooldown_seconds = float_or_default(config[:cooldown_seconds], 1.5)
+    @timeout_seconds  = integer_or_default(config[:timeout_seconds], 60)
+    
+    # Pricing (USD per 1M tokens)
+    @price_input_1m  = float_or_default(config[:price_input_1m], 0.0)
+    @price_output_1m = float_or_default(config[:price_output_1m], 0.0)
 
-    # Model name and cooldown configuration fetched from config/codexes.yml
-    @model_name = config[:model] || config[:model_name]
-    @cooldown_seconds = config[:cooldown_seconds] || 1.5
-
-    # Pricing metrics loaded dynamically from external configuration
-    @price_input_1m = config[:price_input_1m] || 0.0
-    @price_output_1m = config[:price_output_1m] || 0.0
-
-    # Ensure essential configuration is present before proceeding
-    raise CodexError, 'GROQ_API_KEY not configured' unless @api_key
-    raise CodexError, 'API URL not configured for Groq' unless @api_url
-    raise CodexError, 'Model name not configured for Groq' unless @model_name
+    validate_config!
   end
 
-  def version
-    @model_name
-  end
+  def version; @model_name; end
 
-  # Performs a lightweight request to verify API connectivity and model readiness
+  # Lightweight request to verify connectivity and model readiness
   def warmup(warmup_dir)
     puts "  Warmup: Running trivial prompt on Groq (#{@model_name})..."
-    result = run_generation('Respond with just OK.', dir: warmup_dir)
-    puts "  Warmup done in #{result[:elapsed_seconds]}s (success=#{result[:success]})"
-    sleep(@cooldown_seconds)
-    result
+    run_generation('Respond with just OK.', dir: warmup_dir)
   end
 
-  # Main generation loop: Calls API, calculates costs, logs metadata, and saves files
   def run_generation(prompt, dir:, log_path: nil)
     start_time = Time.now
-
     begin
-      response_text, input_tokens, output_tokens = call_groq_api(prompt)
-      cost_usd = calculate_cost(input_tokens, output_tokens)
+      raw, response_text, usage = call_groq_api(prompt)
       elapsed = Time.now - start_time
+      metrics = build_metrics(usage, elapsed)
 
-      # Persistent logging for audit trails and performance analysis
-      if log_path
-        FileUtils.mkdir_p(File.dirname(log_path))
-        log_data = {
-          model: @model_name,
-          prompt: prompt,
-          response: response_text,
-          input_tokens: input_tokens,
-          output_tokens: output_tokens,
-          cost_usd: cost_usd,
-          elapsed_seconds: elapsed.round(1)
-        }
-        File.write(log_path, JSON.pretty_generate(log_data))
-      end
-
-      # Post-processing: Extract and store the generated source code (Delegated to BaseCodex)
+      log_execution(log_path, prompt, metrics, usage, raw) if log_path
       save_generated_code(response_text, dir)
-      sleep(@cooldown_seconds) # Respect rate limits
+      sleep(@cooldown_seconds)
 
-      {
-        success: true,
-        elapsed_seconds: elapsed.round(1),
-        metrics: {
-          input_tokens: input_tokens,
-          output_tokens: output_tokens,
-          cost_usd: cost_usd,
-          model: @model_name,
-          duration_ms: (elapsed * 1000).round
-        },
-        response_text: response_text
-      }
+      { success: true, elapsed_seconds: elapsed.round(1), metrics: metrics, response_text: response_text }
     rescue StandardError => e
-      puts "!!! GROQ DEBUG ERROR: #{e.message}"
-      elapsed = Time.now - start_time
-      {
-        success: false,
-        elapsed_seconds: elapsed.round(1),
-        metrics: nil,
-        error: "Groq Error: #{e.message}"
-      }
+      handle_error(e, start_time)
     end
   end
 
@@ -100,52 +60,93 @@ class GroqCodex < BaseCodex
 
   # Executes the HTTP POST request to the Groq backend
   def call_groq_api(prompt)
-    uri = URI.parse(@api_url) # Use the instance variable instead of a constant
+    uri = URI.parse(@api_url)
     
-    system_instruction = <<~TEXT
-      You are a senior software engineer. 
-      Respond ONLY with the source code. 
-      Do not include any conversational text, explanations, or notes.
-      Always wrap your code in triple backticks with the correct language identifier.
-    TEXT
+    # Path Fallback: Ensure a valid chat completions path is used
+    path = uri.path.empty? ? '/openai/v1/chat/completions' : uri.path
 
-    request_body = {
+    req = Net::HTTP::Post.new(path).tap do |r|
+      r['Content-Type']  = 'application/json'
+      r['Authorization'] = "Bearer #{@api_key}"
+      r.body = JSON.generate(request_payload(prompt))
+    end
+
+    # Perform secure HTTP request
+    Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https', read_timeout: @timeout_seconds) do |http| 
+      http.request(req) 
+    end.then { |res| parse_response(res) }
+  end
+
+  def request_payload(prompt)
+    {
       model: @model_name,
       messages: [
         { role: 'system', content: system_instruction },
         { role: 'user', content: prompt }
       ],
       temperature: 0.1,
-      max_tokens: 4096 
+      max_tokens: 4096
     }
-
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = true
-    http.read_timeout = 60
-
-    request = Net::HTTP::Post.new(uri.path)
-    request['Content-Type'] = 'application/json'
-    request['Authorization'] = "Bearer #{@api_key}"
-    request.body = JSON.generate(request_body)
-
-    response = http.request(request)
-
-    unless response.is_a?(Net::HTTPSuccess)
-      error_msg = JSON.parse(response.body)['error']['message'] rescue response.body
-      raise CodexError, "Groq API error (#{response.code}): #{error_msg}"
-    end
-
-    data = JSON.parse(response.body)
-    response_text = data.dig('choices', 0, 'message', 'content') || ''
-    usage = data['usage'] || {}
-    
-    [response_text, usage['prompt_tokens'] || 0, usage['completion_tokens'] || 0]
   end
 
-  # Cost calculation based on per-million token pricing from config
-  def calculate_cost(input_tokens, output_tokens)
-    input_cost = (input_tokens / 1_000_000.0) * @price_input_1m
-    output_cost = (output_tokens / 1_000_000.0) * @price_output_1m
-    (input_cost + output_cost).round(8)
+  def system_instruction
+    <<~TEXT
+      You are a senior software engineer. Respond ONLY with the source code. 
+      Do not include conversational text or notes. 
+      Always wrap code in triple backticks with the language identifier.
+    TEXT
+  end
+
+  def parse_response(response)
+    unless response.is_a?(Net::HTTPSuccess)
+      # Extract error message from JSON body if possible
+      err = JSON.parse(response.body)['error']['message'] rescue response.body
+      raise CodexError, "Groq API failure (#{response.code}): #{err}"
+    end
+    
+    data = JSON.parse(response.body)
+    usage = data['usage'] || {}
+    [data, data.dig('choices', 0, 'message', 'content') || '', usage]
+  end
+
+  def build_metrics(usage, elapsed)
+    input  = usage['prompt_tokens'] || 0
+    output = usage['completion_tokens'] || 0
+    
+    {
+      input_tokens: input,
+      output_tokens: output,
+      cost_usd: calculate_cost(input, output),
+      model: @model_name,
+      duration_ms: (elapsed * 1000).round
+    }
+  end
+
+  def calculate_cost(input, output)
+    ((input / MILLION) * @price_input_1m + (output / MILLION) * @price_output_1m).round(8)
+  end
+
+  def log_execution(path, prompt, metrics, usage, raw)
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, JSON.pretty_generate({
+      model: @model_name,
+      prompt: prompt,
+      metrics: metrics,
+      usage: usage,
+      raw_response: raw
+    }))
+  end
+
+  def handle_error(e, start_time)
+    puts "\n" + ("!" * 50)
+    puts "❌ GROQ ADAPTER ERROR: #{@model_name} -> #{e.message}"
+    puts ("!" * 50) + "\n"
+    { success: false, elapsed_seconds: (Time.now - start_time).round(1), error: e.message }
+  end
+
+  def validate_config!
+    raise CodexError, 'GROQ_API_KEY not configured' unless @api_key
+    raise CodexError, 'Groq API URL/Endpoint not configured' unless @api_url
+    raise CodexError, 'Model name not configured for Groq' unless @model_name
   end
 end
